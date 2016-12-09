@@ -18,11 +18,13 @@ package raft
 //
 
 import "sync"
-import "github.com/chenshaobo/6.824/labrpc"
+import (
+	"github.com/chenshaobo/6.824/labrpc"
+	"time"
+)
 
 // import "bytes"
 // import "encoding/gob"
-
 
 
 //
@@ -40,27 +42,59 @@ type ApplyMsg struct {
 //
 // A Go object implementing a single Raft peer.
 //
-type Raft struct {
-	mu        sync.Mutex
-	peers     []*labrpc.ClientEnd
-	persister *Persister
-	me        int // index into peers[]
+const (
+	RaftRoleFollowers = 0 << iota
+	RaftRoleCandidates
+	RaftRoleLeaders
+)
 
-	// Your data here.
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
-	currentTerm  int //currentTermlatest term server has seen (initialized to 0on first boot, increases monotonically
+type raftConfig struct {
+	hearbeadTimeout time.Time
+}
+type Raft struct {
+	mu            sync.Mutex
+	peers         []*labrpc.ClientEnd
+	persister     *Persister
+	me            int          // index into peers[]
+
+                               // Your data here.
+                               // Look at the paper's Figure 2 for a description of what
+                               // state a Raft server must maintain.
+	config       raftConfig // some config
+	currentTerm   int          //currentTermlatest term server has seen (initialized to 0on first boot, increases monotonically
+	currentIndex  int
+
+	lastCommitIndex int
+	nextIndexs   []int  //The leader maintains a nextIndex for each follower, which is the index of the next log entry the leader will send to that follower.
+
+	raftLogs      []*raftEntry //log entries;each entry contains command for state machine, and term when entry was received by leader (first index is 1)
+
+	role          int
+
+	hearbeatTimer time.Timer
+	applyCh       chan ApplyMsg
+	candidateCh   chan time.Time
+
+	Votes  int
 
 }
+
+type raftEntry struct {
+	index int
+	command string
+	term    int
+}
+
+type RaftState struct {
+	Term int `json:"term"`
+}
+
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
 	// Your code here.
-	return term, isleader
+	return rf.currentTerm, rf.role == RaftRoleLeaders
 }
 
 //
@@ -99,6 +133,8 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here.
+	Candidate int
+	Term      int
 }
 
 //
@@ -106,6 +142,7 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here.
+	votefor int
 }
 
 //
@@ -113,6 +150,7 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here.
+
 }
 
 //
@@ -138,6 +176,24 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 }
 
 
+
+type AppendEntries struct {
+	Term              int
+	LeaderID          int
+	LeaderCommitIndex int
+}
+
+type AppendEntriesReply struct{
+
+}
+//
+func (rf *Raft) AppendEntriesRPC(args AppendEntries,reply *AppendEntriesReply){
+	//reset the hearbeat time out
+
+	rf.hearbeatTimer.Reset(rf.config.hearbeadTimeout)
+
+}
+
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -156,7 +212,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := true
 
-
 	return index, term, isLeader
 }
 
@@ -170,6 +225,63 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 }
 
+
+//handle the comming msg from other raft instance
+func (rf *Raft) DoHandle(msg ApplyMsg) {
+
+}
+
+
+// change raft 's role between followers,candidate,leader
+func (rf *Raft) ChangeRaftRole(role int) {
+	switch role {
+	case RaftRoleCandidates :
+		rf.role = RaftRoleCandidates
+		rf.currentTerm ++
+		peersLen := len(rf.peers)
+		ra := RequestVoteArgs{Candidate:rf.me,Term:rf.currentTerm}
+		rp := &RequestVoteReply{}
+		for i := 0 ;i< peersLen;i++{
+			if rf.sendRequestVote(i,ra,rp) && rp.votefor == rf.me{
+				rf.Votes ++
+				if rf.Votes > peersLen/2{
+					rf.ChangeRaftRole(RaftRoleLeaders)
+				}
+			}
+		}
+	case RaftRoleLeaders:
+
+	}
+
+}
+
+//leader send hearbeat
+func (rf *Raft) sendHearbeat() {
+	if rf.role == RaftRoleLeaders {
+
+		//for  := range rf.peers {
+		//
+		//}
+	}
+}
+
+func (rf *Raft) Loop() {
+	//
+	select {
+	case <-rf.hearbeatTimer.C:
+		switch (rf.role){
+		case RaftRoleFollowers:
+			rf.ChangeRaftRole(RaftRoleCandidates)
+		case RaftRoleLeaders:
+			rf.sendHearbeat()
+		case RaftRoleCandidates:
+
+		}
+
+	}
+}
+
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -182,17 +294,21 @@ func (rf *Raft) Kill() {
 // for any long-running work.
 //
 func Make(peers []*labrpc.ClientEnd, me int,
-	persister *Persister, applyCh chan ApplyMsg) *Raft {
+persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.Votes = 0
 
 	// Your initialization code here.
-
+	rf.config.hearbeadTimeout = time.Second
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	rf.hearbeatTimer = time.NewTimer(rf.config.hearbeadTimeout)
+	rf.applyCh = applyCh
+	go rf.Loop()
 
 	return rf
 }
