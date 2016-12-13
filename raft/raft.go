@@ -18,11 +18,13 @@ package raft
 //
 
 import "sync"
-import "github.com/chenshaobo/6.824/labrpc"
+import (
+	"github.com/chenshaobo/6.824/labrpc"
+	"time"
+)
 
 // import "bytes"
 // import "encoding/gob"
-
 
 
 //
@@ -37,29 +39,57 @@ type ApplyMsg struct {
 	Snapshot    []byte // ignore for lab2; only used in lab3
 }
 
+const (
+	FOLLOWER = iota
+	CANDIDATES
+	LEADER
+)
 //
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex
-	peers     []*labrpc.ClientEnd
-	persister *Persister
-	me        int // index into peers[]
+	mu               sync.Mutex
+	peers            []*labrpc.ClientEnd
+	persister        *Persister
+	me               int // index into peers[]
 
-	// Your data here.
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
-	currentTerm  int //currentTermlatest term server has seen (initialized to 0on first boot, increases monotonically
-
+                         // Your data here.
+                         // Look at the paper's Figure 2 for a description of what
+                         // state a Raft server must maintain.
+	currentTerm      int //currentTermlatest term server has seen (initialized to 0on first boot, increases monotonically
+	
+	lastCommitIndex  int //
+	lastAppliedIndex int
+	
+	logs             []Log
+	
+	nextIndex        []int
+	matchIndex       []int
+	
+	voteCh           chan int
+	heartbeatCh      chan bool
+	timeoutTimer     time.Timer
+	
+	voteFor          int
+	votes            int
+	
+	role             int
 }
 
+type Log struct {
+	Term    int
+	Index   int
+	Command interface{}
+}
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
+	
 	var term int
 	var isleader bool
 	// Your code here.
+	term = rf.currentTerm
+	isleader = rf.role == LEADER
 	return term, isleader
 }
 
@@ -92,6 +122,30 @@ func (rf *Raft) readPersist(data []byte) {
 }
 
 
+//RequestAppendEntries
+
+type AppendEntriesArgs struct {
+	Term              int
+	LeaderID          int
+	PreLogIndex       int
+	PreLogTerm        int
+	Entries           []Log
+	LeaderCommitIndex int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) AppendEntriesRPC(args AppendEntriesArgs, reply *AppendEntriesReply) {
+	
+}
+
+func (rf *Raft) sendAppendEntriesRPC(server int, args AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntriesRPC", args, reply)
+	return ok
+}
 
 
 //
@@ -99,6 +153,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here.
+	Term         int
+	CandidateID  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -106,6 +164,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here.
+	Term    int
+	VoteFor int
 }
 
 //
@@ -137,7 +197,70 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 	return ok
 }
 
+func (rf *Raft) voteMyself(){
+	rf.currentTerm++
+	rf.voteFor = rf.me
+	rf.votes = 1
+	rf.voteCh <- true
+	
+	rva := RequestVoteArgs{
+		CandidateID:rf.me,
+		Term:rf.currentTerm,
+		LastLogIndex:rf.getLastLogIndex(),
+		LastLogTerm: rf.getLastLogTerm(),
+	}
+	for i:=0;i< len(rf.peers);i++{
+		rvp := &RequestVoteReply{}
+		if i!= rf.me {
+			rf.sendAppendEntriesRPC(i,rva,rvp)
+		}
+		
+	}
+}
 
+func(rf *Raft)getLastLogTerm()int{
+	return rf.logs[len(rf.logs)-1].Term
+}
+func (rf *Raft) getLastLogIndex() int{
+	return rf.logs[len(rf.logs)-1].Index
+}
+func (rf *Raft) broadcastEntries(){
+	
+}
+func (rf *Raft) loop() {
+	for {
+		switch rf.role {
+		case FOLLOWER:
+				select {
+				case <-rf.heartbeatCh:
+				case <-rf.timeoutTimer.C:
+					DPrintf("[TIMEOUT] CHANGE TO CANDIDATES")
+					rf.role = CANDIDATES
+					rf.voteMyself()
+					
+				}
+		case CANDIDATES:
+				select {
+				case <-rf.heartbeatCh:
+					rf.role = FOLLOWER
+				case <-rf.timeoutTimer.C:
+					rf.voteMyself()
+				case <-rf.voteCh:
+					rf.votes++
+					if rf.votes * 2 > len(rf.peers){
+						rf.role = LEADER
+					}
+					
+					
+				}
+		case LEADER:
+			select {
+				case <-rf.timeoutTimer.C:
+				rf.broadcastEntries()
+				}
+		}
+	}
+}
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -155,8 +278,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
 	isLeader := true
-
-
+	
 	return index, term, isLeader
 }
 
@@ -182,17 +304,24 @@ func (rf *Raft) Kill() {
 // for any long-running work.
 //
 func Make(peers []*labrpc.ClientEnd, me int,
-	persister *Persister, applyCh chan ApplyMsg) *Raft {
+persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-
+	
 	// Your initialization code here.
-
+	
+	rf.voteFor = -1
+	rf.role = FOLLOWER
+	rf.heartbeatCh = make(chan bool)
+	rf.voteCh = make(chan int)
+	rf.timeoutTimer = time.NewTimer(time.Millisecond * time.Duration(200))
+	
+	go rf.loop()
+	
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
-
+	
 	return rf
 }
