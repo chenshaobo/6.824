@@ -158,6 +158,7 @@ func (cfg *config) start1(i int) {
 				}
 				_, prevok := cfg.logs[i][m.Index-1]
 				cfg.logs[i][m.Index] = v
+				DPrintf(":%v COMMIT %v on index:%v\n",i,v,m.Index)
 				cfg.mu.Unlock()
 
 				if m.Index > 1 && prevok == false {
@@ -407,6 +408,7 @@ func (cfg *config) one(cmd int, expectedServers int) int {
 			t1 := time.Now()
 			for time.Since(t1).Seconds() < 2 {
 				nd, cmd1 := cfg.nCommitted(index)
+				//DPrintf("NCOMMITTED:%v,%v\n",nd,cmd1)
 				if nd > 0 && nd >= expectedServers {
 					// committed
 					if cmd2, ok := cmd1.(int); ok && cmd2 == cmd {
